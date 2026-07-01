@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Debounced button state machine built on embedded-hal InputPin"
 readme = "README.md"
+repository = "https://github.com/antonsterkhov/debounce-button-eng"
+keywords = ["embedded-hal", "button", "debounce", "no-std", "input"]
+categories = ["embedded", "no-std"]
 
 [dependencies]
 embedded-hal = "1.0.0"
