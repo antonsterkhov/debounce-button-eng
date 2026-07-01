@@ -7,7 +7,7 @@ The crate is not tied to a specific microcontroller or timer. The application
 passes monotonic time in milliseconds, while the crate filters contact bounce
 and returns the stable button state plus short event flags.
 
-This crate is an English-language duplicate of `debounce-button`.
+
 
 ## Features
 
