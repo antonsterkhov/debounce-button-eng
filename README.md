@@ -21,6 +21,11 @@ and returns the stable button state plus short event flags.
 - current and final hold duration;
 - tests based on `embedded-hal-mock`.
 
+## Documentation
+
+API documentation is available on docs.rs:
+<https://docs.rs/debounce-button-eng>.
+
 ## Installation
 
 For local use as a path dependency:
