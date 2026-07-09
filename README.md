@@ -17,6 +17,7 @@ and returns the stable button state plus short event flags.
 - `pressed` and `released` events;
 - single click;
 - double click;
+- configurable multi-click sequence, for example 5 short clicks;
 - hold event;
 - current and final hold duration;
 - tests based on `embedded-hal-mock`.
@@ -40,7 +41,7 @@ version:
 
 ```toml
 [dependencies]
-debounce-button-eng = "0.1"
+debounce-button-eng = "0.2"
 ```
 
 ## Quick Start
@@ -55,7 +56,8 @@ use debounce_button_eng::{Button, ButtonConfig};
 let config = ButtonConfig::active_low()
     .with_debounce_ms(20)
     .with_double_click_ms(300)
-    .with_hold_ms(1_000);
+    .with_hold_ms(1_000)
+    .with_multi_click(5, 3_000);
 
 let mut button = Button::with_config(input_pin, config);
 
@@ -77,6 +79,10 @@ loop {
 
     if update.events.double_click {
         // A double click was completed.
+    }
+
+    if update.events.multi_click {
+        // The configured number of short clicks was completed.
     }
 
     if update.events.hold {
@@ -112,7 +118,8 @@ The crate uses differences between timestamps to determine:
 - how long the input has been stable after a raw change;
 - when a new state can be accepted after debounce;
 - how long the button has been held;
-- whether the second click landed inside the double-click window.
+- whether the second click landed inside the double-click window;
+- whether the next short click arrived before the multi-click timeout expired.
 
 ## Configuration
 
@@ -120,7 +127,8 @@ The crate uses differences between timestamps to determine:
 let config = ButtonConfig::active_low()
     .with_debounce_ms(20)
     .with_double_click_ms(300)
-    .with_hold_ms(1_000);
+    .with_hold_ms(1_000)
+    .with_multi_click(5, 3_000);
 ```
 
 Configuration fields:
@@ -129,7 +137,15 @@ Configuration fields:
   before it becomes the debounced state;
 - `double_click_ms` - maximum interval between two short clicks;
 - `hold_ms` - hold threshold;
+- `multi_click_count` - how many short clicks are required for
+  `events.multi_click`;
+- `multi_click_timeout_ms` - maximum pause between short clicks in one
+  multi-click sequence;
 - `active_level` - electrical level that represents a pressed button.
+
+`multi_click_count` values `0` and `1` disable the multi-click detector. The
+default is disabled, so existing `click` and `double_click` behavior does not
+change unless you opt in.
 
 For a button that is pressed when the input is high:
 
@@ -143,6 +159,8 @@ Timings can be changed at runtime:
 button.set_debounce_ms(30);
 button.set_double_click_ms(250);
 button.set_hold_ms(1_500);
+button.set_multi_click_count(5);
+button.set_multi_click_timeout_ms(3_000);
 ```
 
 ## Events
@@ -162,10 +180,15 @@ Main fields:
   `double_click_ms` window expired;
 - `update.events.double_click` - two short clicks completed inside the
   `double_click_ms` window;
+- `update.events.multi_click` - the configured number of short clicks
+  completed before the pause between clicks exceeded `multi_click_timeout_ms`;
 - `update.events.hold` - the hold threshold was reached;
 - `update.held_ms` - how many milliseconds the button is currently held;
 - `update.released_after_ms` - how many milliseconds the button was held before
   it was released.
+- `update.multi_click_count` - current short-click count in the active
+  multi-click sequence. When `events.multi_click` is true, this value is the
+  configured target count that fired the event.
 
 `events.hold` fires once per hold. If you need the continuously updated hold
 time, read `held_ms`.
@@ -175,6 +198,41 @@ expires. Without this delay, a double click would first emit a single `click`
 and then a `double_click`. The first short release is now stored as a pending
 click. If the second short click arrives in time, only `double_click` is
 emitted. If no second click arrives, the pending click becomes `click`.
+
+## Multi-click Sequences
+
+Use `with_multi_click(count, timeout_ms)` when an action should run only after a
+specific number of short clicks:
+
+```rust,ignore
+let config = ButtonConfig::active_low()
+    .with_debounce_ms(20)
+    .with_hold_ms(1_000)
+    .with_multi_click(5, 3_000);
+```
+
+With this configuration, every short release increments the internal
+multi-click counter. When the fifth short release is accepted before a pause
+greater than `3_000` ms appears between releases, `update.events.multi_click`
+is true for that update and `update.multi_click_count` is `5`.
+
+If the pause between two short releases is greater than
+`multi_click_timeout_ms`, the counter is reset. A long hold is not counted as a
+short click and also clears the active multi-click sequence.
+
+For a configurable double click that allows a longer pause than
+`double_click_ms`, use a target count of `2`:
+
+```rust,ignore
+let config = ButtonConfig::active_low()
+    .with_double_click_ms(250)
+    .with_multi_click(2, 3_000);
+```
+
+In this mode, `events.multi_click` can represent a slow double click within
+three seconds, while `events.double_click` still keeps its stricter
+`double_click_ms` meaning. While a multi-click sequence is active, the delayed
+single `click` is held back until the sequence either completes or times out.
 
 ## How `Button::update` Works
 
@@ -199,6 +257,9 @@ Internal state:
 - `pressed_at` - time when the stable state became `Pressed`;
 - `pending_click_at` - time of a short release that is waiting to become either
   a single `click` or part of a `double_click`;
+- `multi_click_seen` - number of short clicks in the active multi-click
+  sequence;
+- `multi_click_last_at` - time of the latest short release in that sequence;
 - `hold_reported` - whether `hold` has already been emitted for the current
   hold.
 
@@ -229,14 +290,23 @@ One `update(now_ms)` call works like this:
 6. When the stable state becomes `Pressed`, store `pressed_at = now_ms`.
 7. When the stable state becomes `Released`, compute
    `released_after_ms = now_ms - pressed_at`.
-8. If the release happened before `hold_ms`, it is a short-click candidate. It
-   is stored in `pending_click_at`; `events.click` is not emitted yet.
-9. If a second short click completes within `double_click_ms`, emit
-   `events.double_click` and clear the pending single click.
-10. If the second click does not arrive before `double_click_ms` expires, emit
+8. If the release happened before `hold_ms`, it is a short-click candidate.
+9. If multi-click detection is enabled, increment the active sequence count.
+   If the pause since the previous short release is greater than
+   `multi_click_timeout_ms`, reset the count before incrementing it.
+10. If the sequence reaches `multi_click_count`, emit `events.multi_click`,
+    report the target count in `update.multi_click_count`, and clear the
+    sequence.
+11. Store the short release in `pending_click_at`; `events.click` is not
+    emitted yet while the click can still become part of a double click or an
+    active multi-click sequence.
+12. If a second short click completes within `double_click_ms`, emit
+    `events.double_click` and clear the pending single click.
+13. If the second click does not arrive before `double_click_ms` expires and no
+    multi-click sequence is active, emit
     `events.click`.
-11. While the button remains stably pressed, compute `held_ms`.
-12. When `held_ms >= hold_ms`, emit `events.hold` once for the hold.
+14. While the button remains stably pressed, compute `held_ms`.
+15. When `held_ms >= hold_ms`, emit `events.hold` once for the hold.
 
 Example with `debounce_ms = 20`, active-low button:
 
@@ -263,6 +333,8 @@ least `debounce_ms`.
 - `held_ms` is present only while the button is stably pressed;
 - `released_after_ms` is present only in the call that stably released the
   button.
+- `multi_click_count` shows the active multi-click sequence length, or the
+  target count on the update that emits `events.multi_click`.
 
 If `pin.is_high()` returns an error, `update` returns `Err(...)` immediately.
 Internal state is not updated in that case.
@@ -300,14 +372,21 @@ flowchart TD
     short_press -->|yes| register_short_release["register_short_release(now_ms, update)"]
     short_press -->|no| hold_path
 
-    register_short_release --> double_check{"pending_click_at inside\ndouble_click_ms?"}
+    register_short_release --> multi_count["register_multi_click(...)\nreset count if pause > timeout"]
+    multi_count --> multi_target{"multi_click_count reached?"}
+    multi_target -->|yes| multi_event["events.multi_click = true\nclear multi-click count"]
+    multi_target -->|no| double_check
+    multi_event --> double_check{"pending_click_at inside\ndouble_click_ms?"}
     double_check -->|yes| double_event["events.double_click = true\npending_click_at = None"]
-    double_check -->|no| remember_click["pending_click_at = Some(now_ms)"]
+    double_check -->|no| multi_fired{"multi_click fired?"}
+    multi_fired -->|yes| clear_pending["pending_click_at = None"]
+    multi_fired -->|no| remember_click["pending_click_at = Some(now_ms)"]
     remember_click --> pending_check{"pending_click_at expired?"}
     pending_check -->|yes| click_event["events.click = true\npending_click_at = None"]
     pending_check -->|no| hold_path
 
     accept_pressed --> hold_path
+    clear_pending --> hold_path
     click_event --> hold_path
     double_event --> hold_path
 
@@ -333,13 +412,17 @@ The same flow as a list:
 6. A transition to `Released` emits `events.released`, computes
    `released_after_ms`, and calls `register_short_release(...)` for a short
    press.
-7. `register_short_release(...)` either confirms `events.double_click` if the
+7. `register_short_release(...)` updates the multi-click counter when the
+   detector is enabled.
+8. If the counter reaches `multi_click_count`, `events.multi_click` is emitted
+   and the multi-click counter is cleared.
+9. `register_short_release(...)` also confirms `events.double_click` if the
    previous short release was inside `double_click_ms`, or stores a new pending
    single click.
-8. If the pending single click lives longer than `double_click_ms`, `update`
-   emits `events.click`.
-9. If the stable state is currently `Pressed`, `update` computes `held_ms`.
-10. When `held_ms >= hold_ms`, `events.hold` is emitted once for the hold.
+10. If the pending single click lives longer than `double_click_ms` and no
+    multi-click sequence is active, `update` emits `events.click`.
+11. If the stable state is currently `Pressed`, `update` computes `held_ms`.
+12. When `held_ms >= hold_ms`, `events.hold` is emitted once for the hold.
 
 Constructors and configuration:
 
@@ -354,6 +437,9 @@ flowchart LR
     debounce["with_debounce_ms(...)"] --> config
     double["with_double_click_ms(...)"] --> config
     hold["with_hold_ms(...)"] --> config
+    multi_count["with_multi_click_count(...)"] --> config
+    multi_timeout["with_multi_click_timeout_ms(...)"] --> config
+    multi["with_multi_click(...)"] --> config
 ```
 
 ## Tests

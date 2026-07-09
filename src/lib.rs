@@ -59,6 +59,12 @@ pub struct ButtonConfig {
     pub double_click_ms: Millis,
     /// Time after which a continuously pressed button reports a hold event.
     pub hold_ms: Millis,
+    /// Number of short clicks required to emit [`ButtonEvents::multi_click`].
+    ///
+    /// Values `0` and `1` disable the multi-click detector.
+    pub multi_click_count: u8,
+    /// Maximum pause between short clicks in one multi-click sequence.
+    pub multi_click_timeout_ms: Millis,
     /// Electrical level that represents the pressed state.
     pub active_level: ActiveLevel,
 }
@@ -70,6 +76,10 @@ impl ButtonConfig {
     pub const DEFAULT_DOUBLE_CLICK_MS: Millis = 300;
     /// Default hold threshold.
     pub const DEFAULT_HOLD_MS: Millis = 800;
+    /// Default multi-click target count. `0` keeps the detector disabled.
+    pub const DEFAULT_MULTI_CLICK_COUNT: u8 = 0;
+    /// Default timeout for the multi-click detector.
+    pub const DEFAULT_MULTI_CLICK_TIMEOUT_MS: Millis = 3_000;
 
     /// Creates a configuration for the common pull-up wiring where the pressed
     /// state is low.
@@ -79,6 +89,8 @@ impl ButtonConfig {
             debounce_ms: Self::DEFAULT_DEBOUNCE_MS,
             double_click_ms: Self::DEFAULT_DOUBLE_CLICK_MS,
             hold_ms: Self::DEFAULT_HOLD_MS,
+            multi_click_count: Self::DEFAULT_MULTI_CLICK_COUNT,
+            multi_click_timeout_ms: Self::DEFAULT_MULTI_CLICK_TIMEOUT_MS,
             active_level: ActiveLevel::Low,
         }
     }
@@ -112,6 +124,39 @@ impl ButtonConfig {
         self.hold_ms = hold_ms;
         self
     }
+
+    /// Returns the configuration with a different multi-click target count.
+    ///
+    /// Values `0` and `1` disable the detector. Use `2` for a configurable
+    /// double click, `5` for five short clicks, and so on.
+    #[inline]
+    pub const fn with_multi_click_count(mut self, multi_click_count: u8) -> Self {
+        self.multi_click_count = multi_click_count;
+        self
+    }
+
+    /// Returns the configuration with a different multi-click timeout.
+    ///
+    /// The timeout is the maximum pause between two short clicks in the same
+    /// sequence. If the pause is greater than this value, the sequence count is
+    /// reset.
+    #[inline]
+    pub const fn with_multi_click_timeout_ms(mut self, multi_click_timeout_ms: Millis) -> Self {
+        self.multi_click_timeout_ms = multi_click_timeout_ms;
+        self
+    }
+
+    /// Returns the configuration with a multi-click target and timeout.
+    #[inline]
+    pub const fn with_multi_click(
+        mut self,
+        multi_click_count: u8,
+        multi_click_timeout_ms: Millis,
+    ) -> Self {
+        self.multi_click_count = multi_click_count;
+        self.multi_click_timeout_ms = multi_click_timeout_ms;
+        self
+    }
 }
 
 impl Default for ButtonConfig {
@@ -132,6 +177,9 @@ pub struct ButtonEvents {
     pub click: bool,
     /// Two short clicks completed inside the configured interval.
     pub double_click: bool,
+    /// The configured number of short clicks completed before the pause
+    /// between clicks exceeded `multi_click_timeout_ms`.
+    pub multi_click: bool,
     /// The button reached the configured hold threshold.
     pub hold: bool,
 }
@@ -140,7 +188,12 @@ impl ButtonEvents {
     /// Returns `true` if at least one event flag is set.
     #[inline]
     pub const fn any(self) -> bool {
-        self.pressed || self.released || self.click || self.double_click || self.hold
+        self.pressed
+            || self.released
+            || self.click
+            || self.double_click
+            || self.multi_click
+            || self.hold
     }
 }
 
@@ -155,11 +208,17 @@ pub struct ButtonUpdate {
     pub held_ms: Option<Millis>,
     /// Total hold time when this update released the button.
     pub released_after_ms: Option<Millis>,
+    /// Current short-click count in the active multi-click sequence.
+    ///
+    /// The value is `0` when the detector is disabled or no sequence is active.
+    /// When [`ButtonEvents::multi_click`] is true, this field reports the
+    /// target count that fired the event.
+    pub multi_click_count: u8,
 }
 
 impl ButtonUpdate {
     #[inline]
-    const fn idle(state: ButtonState, held_ms: Option<Millis>) -> Self {
+    const fn idle(state: ButtonState, held_ms: Option<Millis>, multi_click_count: u8) -> Self {
         Self {
             state,
             events: ButtonEvents {
@@ -167,10 +226,12 @@ impl ButtonUpdate {
                 released: false,
                 click: false,
                 double_click: false,
+                multi_click: false,
                 hold: false,
             },
             held_ms,
             released_after_ms: None,
+            multi_click_count,
         }
     }
 }
@@ -188,6 +249,8 @@ pub struct Button<PIN> {
     stable_state: ButtonState,
     pressed_at: Option<Millis>,
     pending_click_at: Option<Millis>,
+    multi_click_seen: u8,
+    multi_click_last_at: Option<Millis>,
     hold_reported: bool,
 }
 
@@ -209,6 +272,8 @@ impl<PIN> Button<PIN> {
             stable_state: ButtonState::Released,
             pressed_at: None,
             pending_click_at: None,
+            multi_click_seen: 0,
+            multi_click_last_at: None,
             hold_reported: false,
         }
     }
@@ -223,6 +288,10 @@ impl<PIN> Button<PIN> {
     #[inline]
     pub fn set_config(&mut self, config: ButtonConfig) {
         self.config = config;
+
+        if config.multi_click_count < 2 {
+            self.reset_multi_click();
+        }
     }
 
     /// Returns the current debounce time.
@@ -259,6 +328,55 @@ impl<PIN> Button<PIN> {
     #[inline]
     pub fn set_hold_ms(&mut self, hold_ms: Millis) {
         self.config.hold_ms = hold_ms;
+    }
+
+    /// Returns the configured multi-click target count.
+    ///
+    /// Values `0` and `1` mean that multi-click detection is disabled.
+    #[inline]
+    pub const fn multi_click_count(&self) -> u8 {
+        self.config.multi_click_count
+    }
+
+    /// Sets the multi-click target count.
+    ///
+    /// Values `0` and `1` disable detection and clear the active sequence.
+    #[inline]
+    pub fn set_multi_click_count(&mut self, multi_click_count: u8) {
+        self.config.multi_click_count = multi_click_count;
+
+        if multi_click_count < 2 {
+            self.reset_multi_click();
+        }
+    }
+
+    /// Returns the maximum pause between short clicks in one multi-click
+    /// sequence.
+    #[inline]
+    pub const fn multi_click_timeout_ms(&self) -> Millis {
+        self.config.multi_click_timeout_ms
+    }
+
+    /// Sets the maximum pause between short clicks in one multi-click sequence.
+    #[inline]
+    pub fn set_multi_click_timeout_ms(&mut self, multi_click_timeout_ms: Millis) {
+        self.config.multi_click_timeout_ms = multi_click_timeout_ms;
+    }
+
+    /// Clears the active multi-click sequence.
+    #[inline]
+    pub fn reset_multi_click(&mut self) {
+        self.multi_click_seen = 0;
+        self.multi_click_last_at = None;
+    }
+
+    #[inline]
+    fn visible_multi_click_count(&self) -> u8 {
+        if self.config.multi_click_count < 2 {
+            0
+        } else {
+            self.multi_click_seen
+        }
     }
 
     /// Returns the stable debounced state.
@@ -329,20 +447,28 @@ where
     ///    `double_click_ms`, without emitting an earlier `events.click`.
     /// 9. Emits `events.click` once if the pending click is not followed by a
     ///    second click before `double_click_ms` expires.
-    /// 10. Updates `held_ms` while the button is pressed and emits
+    /// 10. Updates the multi-click sequence after each short release and emits
+    ///     `events.multi_click` when the configured count is reached before
+    ///     `multi_click_timeout_ms` expires between clicks.
+    /// 11. Updates `held_ms` while the button is pressed and emits
     ///     `events.hold` once the hold threshold is reached.
     ///
     /// Event flags are valid only for the returned update. Read the stable
     /// state from [`ButtonUpdate::state`].
     pub fn update(&mut self, now_ms: Millis) -> Result<ButtonUpdate, PIN::Error> {
         let raw_state = self.read_raw_state()?;
+        self.reset_expired_multi_click(now_ms);
 
         if raw_state != self.raw_state {
             self.raw_state = raw_state;
             self.raw_changed_at = now_ms;
         }
 
-        let mut update = ButtonUpdate::idle(self.stable_state, self.held_ms(now_ms));
+        let mut update = ButtonUpdate::idle(
+            self.stable_state,
+            self.held_ms(now_ms),
+            self.visible_multi_click_count(),
+        );
 
         if self.stable_state != self.raw_state
             && elapsed(now_ms, self.raw_changed_at) >= self.config.debounce_ms
@@ -395,16 +521,22 @@ where
 
                 if held_ms.is_some_and(|held_ms| held_ms < self.config.hold_ms) {
                     self.register_short_release(now_ms, update);
+                } else {
+                    self.reset_multi_click();
                 }
             }
         }
     }
 
     fn register_short_release(&mut self, now_ms: Millis, update: &mut ButtonUpdate) {
+        let multi_click_fired = self.register_multi_click(now_ms, update);
+
         if self.pending_click_at.is_some_and(|pending_click_at| {
             elapsed(now_ms, pending_click_at) <= self.config.double_click_ms
         }) {
             update.events.double_click = true;
+            self.pending_click_at = None;
+        } else if multi_click_fired {
             self.pending_click_at = None;
         } else {
             self.report_pending_click(now_ms, update);
@@ -413,12 +545,55 @@ where
     }
 
     fn report_pending_click(&mut self, now_ms: Millis, update: &mut ButtonUpdate) {
+        if self.has_active_multi_click_sequence(now_ms) {
+            return;
+        }
+
         if self.pending_click_at.is_some_and(|pending_click_at| {
             elapsed(now_ms, pending_click_at) > self.config.double_click_ms
         }) {
             update.events.click = true;
             self.pending_click_at = None;
         }
+    }
+
+    fn register_multi_click(&mut self, now_ms: Millis, update: &mut ButtonUpdate) -> bool {
+        if self.config.multi_click_count < 2 {
+            update.multi_click_count = 0;
+            return false;
+        }
+
+        self.reset_expired_multi_click(now_ms);
+
+        self.multi_click_seen = self.multi_click_seen.saturating_add(1);
+        self.multi_click_last_at = Some(now_ms);
+        update.multi_click_count = self.multi_click_seen;
+
+        if self.multi_click_seen >= self.config.multi_click_count {
+            update.events.multi_click = true;
+            update.multi_click_count = self.config.multi_click_count;
+            self.reset_multi_click();
+            return true;
+        }
+
+        false
+    }
+
+    fn reset_expired_multi_click(&mut self, now_ms: Millis) {
+        if self
+            .multi_click_last_at
+            .is_some_and(|last_at| elapsed(now_ms, last_at) > self.config.multi_click_timeout_ms)
+        {
+            self.reset_multi_click();
+        }
+    }
+
+    fn has_active_multi_click_sequence(&self, now_ms: Millis) -> bool {
+        self.config.multi_click_count >= 2
+            && self.multi_click_seen > 0
+            && self.multi_click_last_at.is_some_and(|last_at| {
+                elapsed(now_ms, last_at) <= self.config.multi_click_timeout_ms
+            })
     }
 }
 
@@ -527,6 +702,184 @@ mod tests {
         assert!(update.events.released);
         assert!(!update.events.click);
         assert!(update.events.double_click);
+
+        button.into_inner().done();
+    }
+
+    #[test]
+    fn detects_configured_multi_click_count() {
+        let expectations = [
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::High),
+        ];
+        let pin = PinMock::new(&expectations);
+        let mut button = Button::with_config(
+            pin,
+            config()
+                .with_debounce_ms(5)
+                .with_hold_ms(1000)
+                .with_multi_click(5, 3_000),
+        );
+
+        assert_eq!(button.multi_click_count(), 5);
+        assert_eq!(button.multi_click_timeout_ms(), 3_000);
+
+        assert!(!button.update(0).unwrap().events.any());
+        assert!(button.update(5).unwrap().events.pressed);
+        assert!(!button.update(20).unwrap().events.any());
+        let update = button.update(25).unwrap();
+        assert!(update.events.released);
+        assert_eq!(update.multi_click_count, 1);
+        assert!(!update.events.multi_click);
+
+        assert!(!button.update(80).unwrap().events.any());
+        assert!(button.update(85).unwrap().events.pressed);
+        assert!(!button.update(100).unwrap().events.any());
+        let update = button.update(105).unwrap();
+        assert!(update.events.released);
+        assert_eq!(update.multi_click_count, 2);
+        assert!(!update.events.multi_click);
+
+        assert!(!button.update(160).unwrap().events.any());
+        assert!(button.update(165).unwrap().events.pressed);
+        assert!(!button.update(180).unwrap().events.any());
+        let update = button.update(185).unwrap();
+        assert!(update.events.released);
+        assert_eq!(update.multi_click_count, 3);
+        assert!(!update.events.multi_click);
+
+        assert!(!button.update(240).unwrap().events.any());
+        assert!(button.update(245).unwrap().events.pressed);
+        assert!(!button.update(260).unwrap().events.any());
+        let update = button.update(265).unwrap();
+        assert!(update.events.released);
+        assert_eq!(update.multi_click_count, 4);
+        assert!(!update.events.multi_click);
+
+        assert!(!button.update(320).unwrap().events.any());
+        assert!(button.update(325).unwrap().events.pressed);
+        assert!(!button.update(340).unwrap().events.any());
+        let update = button.update(345).unwrap();
+        assert!(update.events.released);
+        assert_eq!(update.multi_click_count, 5);
+        assert!(update.events.multi_click);
+
+        button.into_inner().done();
+    }
+
+    #[test]
+    fn resets_multi_click_count_after_timeout() {
+        let expectations = [
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::High),
+        ];
+        let pin = PinMock::new(&expectations);
+        let mut button = Button::with_config(
+            pin,
+            config()
+                .with_debounce_ms(5)
+                .with_hold_ms(1000)
+                .with_multi_click(3, 3_000),
+        );
+
+        assert!(!button.update(0).unwrap().events.any());
+        assert!(button.update(5).unwrap().events.pressed);
+        assert!(!button.update(20).unwrap().events.any());
+        let update = button.update(25).unwrap();
+        assert_eq!(update.multi_click_count, 1);
+        assert!(!update.events.multi_click);
+
+        assert!(!button.update(80).unwrap().events.any());
+        assert!(button.update(85).unwrap().events.pressed);
+        assert!(!button.update(100).unwrap().events.any());
+        let update = button.update(105).unwrap();
+        assert_eq!(update.multi_click_count, 2);
+        assert!(!update.events.multi_click);
+
+        let update = button.update(3106).unwrap();
+        assert!(!update.events.any());
+        assert_eq!(update.multi_click_count, 0);
+
+        assert!(!button.update(3200).unwrap().events.any());
+        assert!(button.update(3205).unwrap().events.pressed);
+        assert!(!button.update(3220).unwrap().events.any());
+        let update = button.update(3225).unwrap();
+        assert_eq!(update.multi_click_count, 1);
+        assert!(!update.events.multi_click);
+
+        button.into_inner().done();
+    }
+
+    #[test]
+    fn configurable_double_click_can_use_multi_click_timeout() {
+        let expectations = [
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::Low),
+            PinTransaction::get(PinState::High),
+            PinTransaction::get(PinState::High),
+        ];
+        let pin = PinMock::new(&expectations);
+        let mut button = Button::with_config(
+            pin,
+            config()
+                .with_debounce_ms(5)
+                .with_double_click_ms(200)
+                .with_hold_ms(1000)
+                .with_multi_click(2, 3_000),
+        );
+
+        assert!(!button.update(0).unwrap().events.any());
+        assert!(button.update(5).unwrap().events.pressed);
+        assert!(!button.update(20).unwrap().events.any());
+        let update = button.update(25).unwrap();
+        assert!(update.events.released);
+        assert_eq!(update.multi_click_count, 1);
+        assert!(!update.events.click);
+        assert!(!update.events.double_click);
+        assert!(!update.events.multi_click);
+
+        assert!(!button.update(1000).unwrap().events.any());
+        assert!(button.update(1005).unwrap().events.pressed);
+        assert!(!button.update(1020).unwrap().events.any());
+        let update = button.update(1025).unwrap();
+        assert!(update.events.released);
+        assert!(!update.events.click);
+        assert!(!update.events.double_click);
+        assert_eq!(update.multi_click_count, 2);
+        assert!(update.events.multi_click);
 
         button.into_inner().done();
     }
